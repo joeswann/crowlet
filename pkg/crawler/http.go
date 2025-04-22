@@ -28,6 +28,7 @@ type HTTPConfig struct {
 	Pass       string
 	Timeout    time.Duration
 	ParseLinks bool
+	Headers    map[string]string // Added field for custom headers
 }
 
 // HTTPGetter performs a single HTTP/S  to the url, and return information
@@ -37,7 +38,8 @@ type HTTPGetter func(client *http.Client, url string, config HTTPConfig) (respon
 func createRequest(url string) (*http.Request, *httpstat.Result, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		log.Error(err)
+		// Log error at creation site, but return it for handling
+		log.Errorf("Error creating request for %s: %v", url, err)
 		return nil, nil, err
 	}
 
@@ -50,8 +52,18 @@ func createRequest(url string) (*http.Request, *httpstat.Result, error) {
 }
 
 func configureRequest(req *http.Request, config HTTPConfig) {
+	// Set User-Agent unless explicitly overridden by custom headers
+	if _, exists := config.Headers["User-Agent"]; !exists {
+		req.Header.Set("User-Agent", "Crowlet/"+VERSION) // Use VERSION from main package (consider passing it)
+	}
+
 	if len(config.User) > 0 {
 		req.SetBasicAuth(config.User, config.Pass)
+	}
+	// Add custom headers
+	for key, value := range config.Headers {
+		// Use Set to overwrite potentially default headers like User-Agent if specified
+		req.Header.Set(key, value)
 	}
 }
 
@@ -64,50 +76,63 @@ func HTTPGet(client *http.Client, urlStr string, config HTTPConfig) (response *H
 	req, result, err := createRequest(urlStr)
 	if err != nil {
 		response.Err = err
-		return
+		// Don't print result here, as the request wasn't even made
+		return // Return immediately on request creation error
 	}
+	response.Result = result // Assign result even if client.Do fails later
 
 	configureRequest(req, config)
 
 	resp, err := client.Do(req)
 	response.EndTime = time.Now()
 	response.Response = resp
-	response.Result = result
 
+	// Defer closing the response body and printing the result
 	defer func() {
-		if resp != nil {
+		if resp != nil && resp.Body != nil {
+			// Ensure body is read and closed IF ParseLinks is false
+			// If ParseLinks is true, ExtractLinks will handle reading/closing
 			if !config.ParseLinks {
-				io.Copy(io.Discard, resp.Body)
+				_, _ = io.Copy(io.Discard, resp.Body) // Read to EOF to allow connection reuse
 			}
 			resp.Body.Close()
 		}
+		// Print result regardless of HTTP errors, but maybe not on request creation errors
 		PrintResult(response)
 	}()
 
-	if resp == nil {
-		response.StatusCode = 0
-	} else {
-		response.StatusCode = response.Response.StatusCode
-	}
-
-	// HTTP client error, won't trigger for 4xx or 5xx
+	// Handle client/transport errors (e.g., connection refused, timeout)
 	if err != nil {
-		log.Error(err)
+		log.Errorf("HTTP client error for %s: %v", urlStr, err)
 		response.Err = err
-		return
+		// Status code is often 0 or irrelevant in these cases
+		if urlErr, ok := err.(*url.Error); ok {
+			if urlErr.Timeout() {
+				response.StatusCode = http.StatusGatewayTimeout // Or a custom code?
+			}
+		}
+		// If status code is 0, maybe set a default like 599? or leave as 0?
+		if response.StatusCode == 0 {
+			// Let's keep it 0 to indicate transport-level failure clearly
+		}
+		return // Return after handling client error
 	}
 
-	if config.ParseLinks {
-		currentURL, err := url.Parse(urlStr)
-		if err != nil {
-			log.Error("error parsing base URL:", err)
-			return
-		}
+	// No client error, proceed to record status code and potentially parse links
+	response.StatusCode = resp.StatusCode
 
-		response.Links, err = ExtractLinks(resp.Body, *currentURL)
-		if err != nil {
-			log.Error("error extracting page links:", err)
-			return
+	if config.ParseLinks && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Only attempt to parse links on successful responses
+		currentURL, parseErr := url.Parse(urlStr)
+		if parseErr != nil {
+			log.Errorf("Error parsing base URL '%s' for link extraction: %v", urlStr, parseErr)
+			// Continue without parsing links, response status is still valid
+		} else {
+			response.Links, err = ExtractLinks(resp.Body, *currentURL) // ExtractLinks now reads/closes body
+			if err != nil {
+				log.Errorf("Error extracting page links from %s: %v", urlStr, err)
+				// Continue, response status is still valid
+			}
 		}
 	}
 
@@ -123,13 +148,14 @@ type ConcurrentHTTPGetter interface {
 // BaseConcurrentHTTPGetter implements HTTPGetter interface using net/http package
 type BaseConcurrentHTTPGetter struct {
 	Get HTTPGetter
+	// Consider adding VERSION here if needed for User-Agent
 }
 
 // ConcurrentHTTPGet will GET the urls passed and result the results of the crawling
 func (getter *BaseConcurrentHTTPGetter) ConcurrentHTTPGet(urls []string, config HTTPConfig,
 	maxConcurrent int, quit <-chan struct{}) <-chan *HTTPResponse {
 
-	resultChan := make(chan *HTTPResponse, len(urls))
+	resultChan := make(chan *HTTPResponse, len(urls)) // Buffered channel
 
 	go RunConcurrentGet(getter.Get, urls, config, maxConcurrent, resultChan, quit)
 
@@ -142,57 +168,85 @@ func RunConcurrentGet(httpGet HTTPGetter, urls []string, config HTTPConfig,
 	maxConcurrent int, resultChan chan<- *HTTPResponse, quit <-chan struct{}) {
 
 	var wg sync.WaitGroup
-	clientsReady := make(chan *http.Client, maxConcurrent)
-	for i := 0; i < maxConcurrent; i++ {
-		clientsReady <- &http.Client{
-			Timeout: config.Timeout,
-		}
+	// Use a semaphore channel to limit concurrency
+	semaphore := make(chan struct{}, maxConcurrent)
+
+	// Create a single client with appropriate settings to be shared
+	// This encourages connection reuse if keep-alives are enabled server-side
+	sharedClient := &http.Client{
+		Timeout: config.Timeout,
+		// Add transport settings if needed (e.g., TLS config, proxy)
 	}
 
-	defer func() {
-		wg.Wait()
-		close(resultChan)
-	}()
+	// Ensure channel is closed when all goroutines complete or function exits
+	defer close(resultChan)
+	// Ensure semaphore channel is drained and closed? Not strictly necessary.
 
 	for _, url := range urls {
 		select {
 		case <-quit:
-			log.Info("Waiting for workers to finish...")
-			return
-		case client := <-clientsReady:
+			log.Info("Stop signal received, waiting for active workers to finish...")
+			goto cleanup // Use goto for cleaner exit from loop/select
+		case semaphore <- struct{}{}: // Acquire semaphore slot
 			wg.Add(1)
-
-			go func(client *http.Client, url string) {
+			go func(targetURL string) {
 				defer func() {
-					clientsReady <- client
+					<-semaphore // Release semaphore slot
 					wg.Done()
 				}()
 
-				resultChan <- httpGet(client, url, config)
-			}(client, url)
+				// Check quit signal again before making the request
+				select {
+				case <-quit:
+					log.Debugf("Worker for %s stopping before request due to quit signal", targetURL)
+					return // Don't send result if quitting before request
+				default:
+					// Proceed with request
+					resultChan <- httpGet(sharedClient, targetURL, config)
+				}
+
+			}(url) // Pass url to goroutine explicitly
 		}
 	}
+
+cleanup:
+	// Wait for all active goroutines to finish *after* loop exits or quit is received
+	wg.Wait()
+	log.Debug("All workers finished.")
 }
 
 // PrintResult will print information relative to the HTTPResponse
 func PrintResult(result *HTTPResponse) {
-	total := int(result.Result.Total(result.EndTime).Round(time.Millisecond) / time.Millisecond)
+	// Only print if logging level allows Info or Debug
+	if log.GetLevel() < log.WarnLevel {
+		total := time.Duration(0)
+		// Ensure Result is not nil before accessing fields
+		if result.Result != nil {
+			total = result.Result.Total(result.EndTime).Round(time.Millisecond)
+		}
+		totalMs := int(total / time.Millisecond)
 
-	if log.GetLevel() == log.DebugLevel {
-		log.WithFields(log.Fields{
-			"status":  result.StatusCode,
-			"dns":     int(result.Result.DNSLookup / time.Millisecond),
-			"tcpconn": int(result.Result.TCPConnection / time.Millisecond),
-			"tls":     int(result.Result.TLSHandshake / time.Millisecond),
-			"server":  int(result.Result.ServerProcessing / time.Millisecond),
-			"content": int(result.Result.ContentTransfer(result.EndTime) / time.Millisecond),
-			"time":    total,
-			"close":   result.EndTime,
-		}).Debug("url=" + result.URL)
-	} else {
-		log.WithFields(log.Fields{
-			"status":     result.StatusCode,
-			"total-time": total,
-		}).Info("url=" + result.URL)
+		fields := log.Fields{
+			"status": result.StatusCode, // Always include status
+		}
+
+		// Add timing details only if Result is available and no error occurred
+		// or if debug level is enabled
+		if result.Result != nil && result.Err == nil {
+			fields["total-time"] = totalMs
+			if log.GetLevel() == log.DebugLevel {
+				fields["dns"] = int(result.Result.DNSLookup / time.Millisecond)
+				fields["tcpconn"] = int(result.Result.TCPConnection / time.Millisecond)
+				fields["tls"] = int(result.Result.TLSHandshake / time.Millisecond)
+				fields["server"] = int(result.Result.ServerProcessing / time.Millisecond)
+				fields["content"] = int(result.Result.ContentTransfer(result.EndTime) / time.Millisecond)
+				fields["close"] = result.EndTime.Format(time.RFC3339Nano) // More precise time
+			}
+		} else if result.Err != nil {
+			fields["error"] = result.Err.Error() // Include error message if present
+		}
+
+		log.WithFields(fields).Info("url=" + result.URL)
 	}
 }
+
