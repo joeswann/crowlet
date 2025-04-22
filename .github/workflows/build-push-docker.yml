@@ -20,12 +20,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3 # Use a specific version
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3 # Use a specific version
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }} # User/Org who triggered the workflow
-          password: ${{ secrets.GITHUB_TOKEN }} # Automatically generated token
+      - name: Log in to registry
+        # This is where you will update the PAT to GITHUB_TOKEN
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # - name: Log in to GitHub Container Registry
+      #   uses: docker/login-action@v3 # Use a specific version
+      #   with:
+      #     registry: ghcr.io
+      #     username: ${{ github.actor }} # User/Org who triggered the workflow
+      #     password: ${{ secrets.GITHUB_TOKEN }} # Automatically generated token
 
       - name: Extract Docker metadata
         id: meta # Give this step an ID so we can reference its outputs
