@@ -250,3 +250,4 @@ func PrintResult(result *HTTPResponse) {
 	}
 }
 
+const VERSION = "v0.3.0" // Placeholder if needed locally
