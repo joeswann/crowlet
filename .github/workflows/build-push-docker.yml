@@ -3,9 +3,7 @@ name: Build and Push Docker Image to GHCR
 on:
   push:
     branches:
-      - master # Or 'main' if that's your default branch
-    tags:
-      - "v*.*.*" # Trigger on tags like v0.1.0, v1.2.3
+      - master
 
 jobs:
   build-and-push:
