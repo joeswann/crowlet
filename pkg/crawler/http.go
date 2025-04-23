@@ -275,4 +275,4 @@ func PrintResult(result *HTTPResponse) {
 // VERSION constant needs to be defined or imported if used here
 // It's better practice to pass it via config if needed,
 // but for simplicity, we can redefine it here if pkg/crawler is self-contained.
-// const VERSION = "v0.3.0" // Or import from main/config
+const VERSION = "v0.3.0" // Or import from main/config
