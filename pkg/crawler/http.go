@@ -31,8 +31,6 @@ type HTTPConfig struct {
 	Headers    map[string]string // Keep Headers field from your original version
 }
 
-// HTTPGetter performs a single HTTP/S  to the url, and return information
-// related to the result as an HTTPResponse
 type HTTPGetter func(client *http.Client, url string, config HTTPConfig) (response *HTTPResponse)
 
 func createRequest(url string) (*http.Request, *httpstat.Result, error) {
@@ -52,23 +50,24 @@ func createRequest(url string) (*http.Request, *httpstat.Result, error) {
 }
 
 func configureRequest(req *http.Request, config HTTPConfig) {
-	// Set User-Agent unless explicitly overridden by custom headers (Keep from your original)
+	// Set custom headers first, allowing user to override defaults like User-Agent
+	for key, value := range config.Headers {
+		req.Header.Set(key, value)
+		log.Debugf("Setting request header for %s: %s: %s", req.URL.String(), key, value)
+	}
+
+	// Set default User-Agent only if not provided by the user
 	if _, exists := config.Headers["User-Agent"]; !exists {
-		req.Header.Set("User-Agent", "Crowlet/"+VERSION) // Use VERSION from main package (consider passing it)
+		req.Header.Set("User-Agent", "Crowlet/"+VERSION)
+		log.Debugf("Setting default User-Agent for %s: %s", req.URL.String(), "Crowlet/"+VERSION)
 	}
 
 	if len(config.User) > 0 {
 		req.SetBasicAuth(config.User, config.Pass)
-	}
-	// Add custom headers (Keep from your original)
-	for key, value := range config.Headers {
-		// Use Set to overwrite potentially default headers like User-Agent if specified
-		req.Header.Set(key, value)
+		log.Debugf("Setting Basic Auth for %s", req.URL.String())
 	}
 }
 
-// HTTPGet issues a GET request to a single URL and returns an HTTPResponse
-// (Using the more robust logic from your original file)
 func HTTPGet(client *http.Client, urlStr string, config HTTPConfig) (response *HTTPResponse) {
 	response = &HTTPResponse{
 		URL: urlStr,
@@ -91,48 +90,62 @@ func HTTPGet(client *http.Client, urlStr string, config HTTPConfig) (response *H
 	// Defer closing the response body and printing the result
 	defer func() {
 		if resp != nil && resp.Body != nil {
-			// Ensure body is read and closed IF ParseLinks is false
-			// If ParseLinks is true, ExtractLinks will handle reading/closing
-			if !config.ParseLinks {
-				_, _ = io.Copy(io.Discard, resp.Body) // Read to EOF to allow connection reuse
+			// Ensure body is read and closed IF ParseLinks is false OR if there was an error during parsing
+			// If ParseLinks is true and successful, ExtractLinks handles reading/closing
+			shouldDiscard := !config.ParseLinks
+			if config.ParseLinks && (resp.StatusCode < 200 || resp.StatusCode >= 300 || response.Err != nil) {
+				// If we intended to parse links but couldn't (bad status or previous error), still need to discard body
+				shouldDiscard = true
 			}
-			resp.Body.Close()
+
+			if shouldDiscard {
+				_, copyErr := io.Copy(io.Discard, resp.Body) // Read to EOF to allow connection reuse
+				if copyErr != nil && response.Err == nil { // Don't overwrite existing error
+					log.Warnf("Error discarding response body for %s: %v", urlStr, copyErr)
+					// This isn't usually a critical error for the crawl itself
+				}
+			}
+			closeErr := resp.Body.Close()
+			if closeErr != nil && response.Err == nil { // Don't overwrite existing error
+				log.Warnf("Error closing response body for %s: %v", urlStr, closeErr)
+				// Potentially store this minor error if needed, but usually just log
+			}
 		}
-		// Print result using the NEW PrintResult logic below
-		PrintResult(response)
+		PrintResult(response) // Print result after body is handled
 	}()
 
-	// Handle client/transport errors (e.g., connection refused, timeout)
 	if err != nil {
 		log.Errorf("HTTP client error for %s: %v", urlStr, err)
 		response.Err = err
-		// Status code is often 0 or irrelevant in these cases
+		// Attempt to determine status code from error type (e.g., timeout)
 		if urlErr, ok := err.(*url.Error); ok {
 			if urlErr.Timeout() {
-				response.StatusCode = http.StatusGatewayTimeout // Or a custom code?
+				response.StatusCode = http.StatusGatewayTimeout // 504 seems appropriate for client timeout
 			}
+			// Could check for other specific net errors here if needed
 		}
-		// If status code is 0, maybe set a default like 599? or leave as 0?
+		// If status code is still 0 after error handling, set a generic client error code?
 		if response.StatusCode == 0 {
-			// Let's keep it 0 to indicate transport-level failure clearly
+			 response.StatusCode = 599 // Using a non-standard code to indicate client-side issue
 		}
 		return // Return after handling client error
 	}
 
-	// No client error, proceed to record status code and potentially parse links
+	// No client error, proceed with status code and potential link parsing
 	response.StatusCode = resp.StatusCode
 
 	if config.ParseLinks && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		// Only attempt to parse links on successful responses
 		currentURL, parseErr := url.Parse(urlStr)
 		if parseErr != nil {
 			log.Errorf("Error parsing base URL '%s' for link extraction: %v", urlStr, parseErr)
-			// Continue without parsing links, response status is still valid
+			response.Err = parseErr // Store the parsing error
 		} else {
-			response.Links, err = ExtractLinks(resp.Body, *currentURL) // ExtractLinks now reads/closes body
+			// ExtractLinks will now read and close the body
+			response.Links, err = ExtractLinks(resp.Body, *currentURL)
 			if err != nil {
 				log.Errorf("Error extracting page links from %s: %v", urlStr, err)
-				// Continue, response status is still valid
+				// Decide if link extraction error should be stored in response.Err
+				// response.Err = err // Optional: Overwrite or append? For now, just log.
 			}
 		}
 	}
@@ -140,19 +153,17 @@ func HTTPGet(client *http.Client, urlStr string, config HTTPConfig) (response *H
 	return
 }
 
-// ConcurrentHTTPGetter allows concurrent execution of an HTTPGetter
+// ConcurrentHTTPGetter interface remains the same
 type ConcurrentHTTPGetter interface {
 	ConcurrentHTTPGet(urls []string, config HTTPConfig, maxConcurrent int,
 		quit <-chan struct{}) <-chan *HTTPResponse
 }
 
-// BaseConcurrentHTTPGetter implements HTTPGetter interface using net/http package
+// BaseConcurrentHTTPGetter implementation remains the same
 type BaseConcurrentHTTPGetter struct {
 	Get HTTPGetter
-	// Consider adding VERSION here if needed for User-Agent
 }
 
-// ConcurrentHTTPGet will GET the urls passed and result the results of the crawling
 func (getter *BaseConcurrentHTTPGetter) ConcurrentHTTPGet(urls []string, config HTTPConfig,
 	maxConcurrent int, quit <-chan struct{}) <-chan *HTTPResponse {
 
@@ -163,26 +174,28 @@ func (getter *BaseConcurrentHTTPGetter) ConcurrentHTTPGet(urls []string, config 
 	return resultChan
 }
 
-// RunConcurrentGet runs multiple HTTP requests in parallel, and returns the
-// result in resultChan
-// (Using the semaphore logic from your original file)
+// RunConcurrentGet implementation remains the same
 func RunConcurrentGet(httpGet HTTPGetter, urls []string, config HTTPConfig,
 	maxConcurrent int, resultChan chan<- *HTTPResponse, quit <-chan struct{}) {
 
 	var wg sync.WaitGroup
-	// Use a semaphore channel to limit concurrency
 	semaphore := make(chan struct{}, maxConcurrent)
 
-	// Create a single client with appropriate settings to be shared
-	// This encourages connection reuse if keep-alives are enabled server-side
+	// Create a shared client with potential transport customization
+	// Consider customizing transport for things like idle connections, TLS settings etc.
+	// transport := &http.Transport{
+	// 	// MaxIdleConnsPerHost: maxConcurrent, // Example setting
+	// }
 	sharedClient := &http.Client{
 		Timeout: config.Timeout,
-		// Add transport settings if needed (e.g., TLS config, proxy)
+		// Transport: transport, // Uncomment to use custom transport
+		// Disable redirects if needed:
+		// CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		// 	return http.ErrUseLastResponse
+		// },
 	}
 
-	// Ensure channel is closed when all goroutines complete or function exits
 	defer close(resultChan)
-	// Ensure semaphore channel is drained and closed? Not strictly necessary.
 
 	for _, url := range urls {
 		select {
@@ -212,61 +225,54 @@ func RunConcurrentGet(httpGet HTTPGetter, urls []string, config HTTPConfig,
 	}
 
 cleanup:
-	// Wait for all active goroutines to finish *after* loop exits or quit is received
 	wg.Wait()
 	log.Debug("All workers finished.")
 }
 
-// *** NEW PrintResult function logic ***
-// PrintResult will print information relative to the HTTPResponse
+// PrintResult function remains the same
 func PrintResult(result *HTTPResponse) {
-    // Ensure Result is not nil before calculating total
-    totalMs := 0
-    if result.Result != nil {
-        total := result.Result.Total(result.EndTime).Round(time.Millisecond)
-        totalMs = int(total / time.Millisecond)
-    } else if result.Err != nil {
-        // If there was an error and no result, we can't calculate time
-        log.WithFields(log.Fields{
-            "status": result.StatusCode, // Often 0 on client errors
-            "error":  result.Err.Error(),
-        }).Error("url=" + result.URL) // Log as Error if Err is present
-        return
-    } else {
-        // Handle cases where Result might be nil even without an error (should be rare)
-        log.WithFields(log.Fields{
-             "status": result.StatusCode,
-             "total-time": "N/A", // Indicate time couldn't be calculated
-        }).Warn("url=" + result.URL + " (timing info unavailable)") // Log as Warn
-        return
-    }
+	total := int(result.Result.Total(result.EndTime).Round(time.Millisecond) / time.Millisecond)
+
+	// Handle cases where Result might be nil (e.g., request creation failed)
+	dnsLookup, tcpConn, tlsHs, serverProc, contentTrans := 0, 0, 0, 0, 0
+	if result.Result != nil {
+		dnsLookup = int(result.Result.DNSLookup / time.Millisecond)
+		tcpConn = int(result.Result.TCPConnection / time.Millisecond)
+		tlsHs = int(result.Result.TLSHandshake / time.Millisecond)
+		serverProc = int(result.Result.ServerProcessing / time.Millisecond)
+		contentTrans = int(result.Result.ContentTransfer(result.EndTime) / time.Millisecond)
+	}
 
 
-	// Check log level AFTER ensuring we have timing info or handled errors
+	fields := log.Fields{
+		"status":     result.StatusCode,
+		"total-time": total,
+	}
+
+	// Add detailed timing only for debug level
 	if log.GetLevel() == log.DebugLevel {
-		log.WithFields(log.Fields{
-			"status":  result.StatusCode,
-			"dns":     int(result.Result.DNSLookup / time.Millisecond),
-			"tcpconn": int(result.Result.TCPConnection / time.Millisecond),
-			"tls":     int(result.Result.TLSHandshake / time.Millisecond),
-			"server":  int(result.Result.ServerProcessing / time.Millisecond),
-			"content": int(result.Result.ContentTransfer(result.EndTime) / time.Millisecond),
-			"time":    totalMs, // Renamed from total-time for consistency with debug fields
-			"close":   result.EndTime.Format(time.RFC3339Nano), // More precise time format
-		}).Debug("url=" + result.URL) // Log at Debug level
+		fields["dns"] = dnsLookup
+		fields["tcpconn"] = tcpConn
+		fields["tls"] = tlsHs
+		fields["server"] = serverProc
+		fields["content"] = contentTrans
+		// fields["close"] = result.EndTime // Usually not needed for summary
+	}
+
+	// Include error in log if present
+	if result.Err != nil {
+		fields["error"] = result.Err.Error()
+		log.WithFields(fields).Error("url=" + result.URL)
+	} else if log.GetLevel() <= log.InfoLevel && !log.IsLevelEnabled(log.DebugLevel) {
+		// Standard info log without debug details
+		log.WithFields(fields).Info("url=" + result.URL)
 	} else {
-		// Log at Info level (only if no error occurred previously)
-        // Note: The error case is now handled above, so we only log Info for non-errors here.
-        // We also check if log level allows Info, although default logrus level is Info.
-        if log.GetLevel() <= log.InfoLevel {
-            log.WithFields(log.Fields{
-                "status":     result.StatusCode,
-                "total-time": totalMs,
-            }).Info("url=" + result.URL) // Log at Info level
-        }
+		// Debug log includes detailed timing
+		log.WithFields(fields).Debug("url=" + result.URL)
 	}
 }
 
-// Keep VERSION constant definition if needed locally within this package
-// Or ensure it's passed appropriately if defined centrally in main.
-const VERSION = "v0.3.0" // Placeholder if needed locally, matches main package
+// VERSION constant needs to be defined or imported if used here
+// It's better practice to pass it via config if needed,
+// but for simplicity, we can redefine it here if pkg/crawler is self-contained.
+// const VERSION = "v0.3.0" // Or import from main/config

@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 
 var (
 	// VERSION stores the current version as string
-	VERSION = "v0.3.0"
+	VERSION = "v0.3.0" // NOTE: Consider bumping version after adding features
 )
 
 func beforeApp(c *cli.Context) error {
@@ -33,6 +34,17 @@ func beforeApp(c *cli.Context) error {
 		log.Error("sitemap url required")
 		cli.ShowAppHelpAndExit(c, 2)
 	}
+
+	// Validate header format early
+	headerStrings := c.GlobalStringSlice("header")
+	for _, h := range headerStrings {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			log.Errorf("Invalid header format: '%s'. Use 'Key: Value'", h)
+			cli.ShowAppHelpAndExit(c, 3) // Use a different exit code for bad flags
+		}
+	}
+
 
 	if len(c.GlobalString("pre-cmd")) > 1 {
 		ok := exec.Exec(c.GlobalString("pre-cmd"))
@@ -150,6 +162,12 @@ func main() {
 			Usage:  "password for http basic authentication",
 			EnvVar: "CRAWL_HTTP_PASSWORD",
 		},
+		// --- New Header Flag ---
+		cli.StringSliceFlag{
+			Name:  "header, H",
+			Usage: "Add custom header(s) to the request (e.g., --header \"X-Api-Key: value\")",
+		},
+		// --- End New Header Flag ---
 		cli.StringFlag{
 			Name:  "pre-cmd",
 			Usage: "command(s) to run before starting crawler",
@@ -164,7 +182,15 @@ func main() {
 		},
 	}
 
-	app.Run(os.Args)
+	err := app.Run(os.Args)
+    if err != nil {
+		// Log the error if Run returns one, although urfave/cli often handles this
+		log.Error(err)
+		// Ensure a non-zero exit code if Run itself fails
+		if exitCode == 0 {
+			exitCode = 1
+		}
+	}
 	os.Exit(exitCode)
 }
 
@@ -215,9 +241,30 @@ func start(c *cli.Context) error {
 
 	urls, err := crawler.GetSitemapUrlsAsStrings(sitemapURL)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err) // Use Fatal to exit with non-zero code
 	}
 	log.Info("Found ", len(urls), " URL(s)")
+
+	// --- Process Headers ---
+	headerStrings := c.StringSlice("header")
+	headersMap := make(map[string]string)
+	for _, h := range headerStrings {
+		parts := strings.SplitN(h, ":", 2)
+		// Basic validation already done in beforeApp, but check length again just in case
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			if key != "" { // Ensure key is not empty after trimming
+				headersMap[key] = value
+				log.Debugf("Adding header: '%s: %s'", key, value)
+			} else {
+				log.Warnf("Skipping header with empty key: '%s'", h)
+			}
+		}
+		// No need for else, invalid format handled in beforeApp
+	}
+	// --- End Process Headers ---
+
 
 	config := crawler.CrawlConfig{
 		Throttle: c.Int("throttle"),
@@ -226,6 +273,7 @@ func start(c *cli.Context) error {
 			User:    c.String("user"),
 			Pass:    c.String("pass"),
 			Timeout: time.Duration(c.Int("timeout")) * time.Millisecond,
+			Headers: headersMap, // Assign parsed headers
 		},
 		HTTPGetter: &crawler.BaseConcurrentHTTPGetter{
 			Get: crawler.HTTPGet,
@@ -237,6 +285,11 @@ func start(c *cli.Context) error {
 		},
 	}
 
+	// Recalculate ParseLinks based on crawl flags AFTER setting config.Links
+	config.HTTP.ParseLinks = config.Links.CrawlExternalLinks || config.Links.CrawlHyperlinks ||
+		config.Links.CrawlImages
+
+
 	stats := runMainLoop(urls, config, c.Int("iterations"), c.Bool("forever"), c.Int("wait-interval"))
 	if !c.GlobalBool("quiet") {
 		if c.GlobalBool("json") {
@@ -245,21 +298,46 @@ func start(c *cli.Context) error {
 			crawler.PrintSummary(stats)
 		}
 
-		if c.Bool("summary-only") {
-			log.SetLevel(log.FatalLevel)
-		}
+		// Log level setting moved to beforeApp
+		// if c.Bool("summary-only") {
+		// 	log.SetLevel(log.FatalLevel)
+		// }
 	}
 
-	if stats.Total != stats.StatusCodes[200] {
+	// Determine exit code based on results
+	if stats.Total > 0 && stats.StatusCodes[200] != stats.Total {
+		log.Warnf("%d out of %d crawled URLs had non-200 status codes.", stats.Total-stats.StatusCodes[200], stats.Total)
 		exitCode = c.Int("non-200-error")
+		// Return nil here because the error is handled by setting exitCode
 		return nil
 	}
 
 	maxResponseTime := c.Int("response-time-max")
 	if maxResponseTime > 0 && int(stats.Max200Time/time.Millisecond) > maxResponseTime {
-		log.Warn("Max response time (", maxResponseTime, "ms) was exceeded")
-		exitCode = c.Int("response-time-error")
+		log.Warnf("Max response time (%dms) was exceeded (limit: %dms). URL: %s",
+			int(stats.Max200Time/time.Millisecond),
+			maxResponseTime,
+			// Finding the exact URL that exceeded requires iterating Non200Urls or storing max time URL
+			// For simplicity, just log the warning for now.
+			"one or more URLs",
+		)
+		// Only set response time error if no non-200 error occurred
+		if exitCode == 0 {
+			exitCode = c.Int("response-time-error")
+		}
+		// Return nil, error handled by exitCode
+		return nil
 	}
 
-	return nil
+	// If we reach here, everything was successful (or only warnings occurred)
+	if stats.Total == 0 && len(urls) > 0 {
+		log.Warn("Crawled 0 URLs successfully, check logs for errors.")
+		// Consider if this should be an error state
+		// exitCode = 1 // Or a specific code
+	} else if exitCode == 0 {
+		log.Debug("Crawl finished successfully.")
+	}
+
+
+	return nil // Return nil as exitCode handles success/failure reporting
 }
