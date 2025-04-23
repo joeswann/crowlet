@@ -28,7 +28,7 @@ type HTTPConfig struct {
 	Pass       string
 	Timeout    time.Duration
 	ParseLinks bool
-	Headers    map[string]string // Added field for custom headers
+	Headers    map[string]string // Keep Headers field from your original version
 }
 
 // HTTPGetter performs a single HTTP/S  to the url, and return information
@@ -52,7 +52,7 @@ func createRequest(url string) (*http.Request, *httpstat.Result, error) {
 }
 
 func configureRequest(req *http.Request, config HTTPConfig) {
-	// Set User-Agent unless explicitly overridden by custom headers
+	// Set User-Agent unless explicitly overridden by custom headers (Keep from your original)
 	if _, exists := config.Headers["User-Agent"]; !exists {
 		req.Header.Set("User-Agent", "Crowlet/"+VERSION) // Use VERSION from main package (consider passing it)
 	}
@@ -60,7 +60,7 @@ func configureRequest(req *http.Request, config HTTPConfig) {
 	if len(config.User) > 0 {
 		req.SetBasicAuth(config.User, config.Pass)
 	}
-	// Add custom headers
+	// Add custom headers (Keep from your original)
 	for key, value := range config.Headers {
 		// Use Set to overwrite potentially default headers like User-Agent if specified
 		req.Header.Set(key, value)
@@ -68,6 +68,7 @@ func configureRequest(req *http.Request, config HTTPConfig) {
 }
 
 // HTTPGet issues a GET request to a single URL and returns an HTTPResponse
+// (Using the more robust logic from your original file)
 func HTTPGet(client *http.Client, urlStr string, config HTTPConfig) (response *HTTPResponse) {
 	response = &HTTPResponse{
 		URL: urlStr,
@@ -97,7 +98,7 @@ func HTTPGet(client *http.Client, urlStr string, config HTTPConfig) (response *H
 			}
 			resp.Body.Close()
 		}
-		// Print result regardless of HTTP errors, but maybe not on request creation errors
+		// Print result using the NEW PrintResult logic below
 		PrintResult(response)
 	}()
 
@@ -164,6 +165,7 @@ func (getter *BaseConcurrentHTTPGetter) ConcurrentHTTPGet(urls []string, config 
 
 // RunConcurrentGet runs multiple HTTP requests in parallel, and returns the
 // result in resultChan
+// (Using the semaphore logic from your original file)
 func RunConcurrentGet(httpGet HTTPGetter, urls []string, config HTTPConfig,
 	maxConcurrent int, resultChan chan<- *HTTPResponse, quit <-chan struct{}) {
 
@@ -215,39 +217,56 @@ cleanup:
 	log.Debug("All workers finished.")
 }
 
+// *** NEW PrintResult function logic ***
 // PrintResult will print information relative to the HTTPResponse
 func PrintResult(result *HTTPResponse) {
-	// Only print if logging level allows Info or Debug
-	if log.GetLevel() < log.WarnLevel {
-		total := time.Duration(0)
-		// Ensure Result is not nil before accessing fields
-		if result.Result != nil {
-			total = result.Result.Total(result.EndTime).Round(time.Millisecond)
-		}
-		totalMs := int(total / time.Millisecond)
+    // Ensure Result is not nil before calculating total
+    totalMs := 0
+    if result.Result != nil {
+        total := result.Result.Total(result.EndTime).Round(time.Millisecond)
+        totalMs = int(total / time.Millisecond)
+    } else if result.Err != nil {
+        // If there was an error and no result, we can't calculate time
+        log.WithFields(log.Fields{
+            "status": result.StatusCode, // Often 0 on client errors
+            "error":  result.Err.Error(),
+        }).Error("url=" + result.URL) // Log as Error if Err is present
+        return
+    } else {
+        // Handle cases where Result might be nil even without an error (should be rare)
+        log.WithFields(log.Fields{
+             "status": result.StatusCode,
+             "total-time": "N/A", // Indicate time couldn't be calculated
+        }).Warn("url=" + result.URL + " (timing info unavailable)") // Log as Warn
+        return
+    }
 
-		fields := log.Fields{
-			"status": result.StatusCode, // Always include status
-		}
 
-		// Add timing details only if Result is available and no error occurred
-		// or if debug level is enabled
-		if result.Result != nil && result.Err == nil {
-			fields["total-time"] = totalMs
-			if log.GetLevel() == log.DebugLevel {
-				fields["dns"] = int(result.Result.DNSLookup / time.Millisecond)
-				fields["tcpconn"] = int(result.Result.TCPConnection / time.Millisecond)
-				fields["tls"] = int(result.Result.TLSHandshake / time.Millisecond)
-				fields["server"] = int(result.Result.ServerProcessing / time.Millisecond)
-				fields["content"] = int(result.Result.ContentTransfer(result.EndTime) / time.Millisecond)
-				fields["close"] = result.EndTime.Format(time.RFC3339Nano) // More precise time
-			}
-		} else if result.Err != nil {
-			fields["error"] = result.Err.Error() // Include error message if present
-		}
-
-		log.WithFields(fields).Info("url=" + result.URL)
+	// Check log level AFTER ensuring we have timing info or handled errors
+	if log.GetLevel() == log.DebugLevel {
+		log.WithFields(log.Fields{
+			"status":  result.StatusCode,
+			"dns":     int(result.Result.DNSLookup / time.Millisecond),
+			"tcpconn": int(result.Result.TCPConnection / time.Millisecond),
+			"tls":     int(result.Result.TLSHandshake / time.Millisecond),
+			"server":  int(result.Result.ServerProcessing / time.Millisecond),
+			"content": int(result.Result.ContentTransfer(result.EndTime) / time.Millisecond),
+			"time":    totalMs, // Renamed from total-time for consistency with debug fields
+			"close":   result.EndTime.Format(time.RFC3339Nano), // More precise time format
+		}).Debug("url=" + result.URL) // Log at Debug level
+	} else {
+		// Log at Info level (only if no error occurred previously)
+        // Note: The error case is now handled above, so we only log Info for non-errors here.
+        // We also check if log level allows Info, although default logrus level is Info.
+        if log.GetLevel() <= log.InfoLevel {
+            log.WithFields(log.Fields{
+                "status":     result.StatusCode,
+                "total-time": totalMs,
+            }).Info("url=" + result.URL) // Log at Info level
+        }
 	}
 }
 
-const VERSION = "v0.3.0" // Placeholder if needed locally
+// Keep VERSION constant definition if needed locally within this package
+// Or ensure it's passed appropriately if defined centrally in main.
+const VERSION = "v0.3.0" // Placeholder if needed locally, matches main package
